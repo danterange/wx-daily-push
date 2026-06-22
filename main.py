@@ -1,6 +1,11 @@
-"""每日天气推送主程序 —— 详细版。
+"""每日天气推送主程序 —— 路线A:测试号模板消息(纯文字多行)。
 
-数据来自和风天气;复用 test_push.py 中已验证的推送函数。
+数据来自和风天气,经微信测试号模板消息推送(复用 test_push.py 的发送函数)。
+模板消息坑点规避:
+  · 每个字段一行,字段内绝不含换行符(\\n 会被微信截断,这是"海淀消失"的根因)
+  · 整条内容 ≤200 字(连续数字/字母算 1 字),我们实际约 90 字,余量充足
+  · emoji 是否被去除属待实测项,本版保留少量 emoji 用于验证
+
 特性:
   · 实时天气 + 今日温度区间(逐天)
   · 扫描未来 24 小时逐小时预报,智能生成"降水时段"提醒
@@ -89,7 +94,7 @@ def scan_rain(hourly: list[dict]) -> tuple[str, bool]:
 
     # 3. 无降水:返回正向提示
     if not intervals:
-        return "☔ 未来24h无降水 ✅", False
+        return "☔未来24h无降水", False
 
     # 4. 取首个降水时段,计算起止时刻与最大概率
     a, b = intervals[0]
@@ -103,8 +108,8 @@ def scan_rain(hourly: list[dict]) -> tuple[str, bool]:
             pass
     max_pop = max(pops) if pops else 0
     text = hourly[a].get("text", "降水")
-    more = "  等多段" if len(intervals) > 1 else ""
-    return f"☔ {start}-{end} {text}(概率{max_pop}%),记得带伞{more}", True
+    more = " 等" if len(intervals) > 1 else ""
+    return f"☔{start}-{end}{text}{max_pop}% 带伞{more}", True
 
 
 def tomorrow_morning_line(hourly: list[dict], tomorrow_md: str) -> str | None:
@@ -114,11 +119,11 @@ def tomorrow_morning_line(hourly: list[dict], tomorrow_md: str) -> str | None:
     if not picks:
         return None
     h = picks[len(picks) // 2]  # 取中间一条(约 7-8 点)
-    return f"🌙 明早{h['fxTime'][11:16]}:{h['text']} {h['temp']}℃"
+    return f"🌙明早{h['fxTime'][11:16]}{h['text']}{h['temp']}℃"
 
 
-def fetch_index_line(host: str, key: str, lid: str, slot: str) -> str | None:
-    """按时段抓对应生活指数,返回一行如 "👕 穿衣:炎热";失败返回 None(降级)。"""
+def fetch_index_word(host: str, key: str, lid: str, slot: str) -> str | None:
+    """按时段抓对应生活指数,返回简短词如 "穿衣:炎热";失败返回 None(降级)。"""
     itype = SLOT_INDEX_TYPE[slot]
     try:
         resp = qweather(host, key, "/indices/1d", {"location": lid, "type": itype})
@@ -129,13 +134,14 @@ def fetch_index_line(host: str, key: str, lid: str, slot: str) -> str | None:
         return None
     idx = daily[0]
     name = idx.get("name", "").replace("指数", "")
-    return f"📋 {name}:{idx.get('category', '')}"
+    return f"{name}:{idx.get('category', '')}"
 
 
-def build_city_summary(host: str, key: str, city: str, slot: str, now_bj: datetime) -> tuple[str, str, bool]:
-    """抓取单个城市的多维度天气,拼成多行摘要。
+def build_city_lines(host: str, key: str, city: str, slot: str, now_bj: datetime) -> tuple[str, str, bool]:
+    """抓取单个城市天气,拼成两行单行文本(行内绝不含换行符)。
 
-    返回 (城市名, 摘要文本, 是否有雨)。任一接口失败由上层捕获降级。
+    返回 (第一行, 第二行, 是否有雨)。两行分别填进模板两个字段,
+    规避"单字段含换行被微信截断"的坑。任一接口失败由上层捕获降级。
     """
     # 1. 城市解析
     lid, name = resolve_location_id(host, key, city)
@@ -145,27 +151,26 @@ def build_city_summary(host: str, key: str, city: str, slot: str, now_bj: dateti
     today = qweather(host, key, "/v7/weather/7d", {"location": lid})["daily"][0]
     hourly = qweather(host, key, "/v7/weather/24h", {"location": lid})["hourly"]
 
-    # 3. 逐行拼装
-    lines = []
-    # 3.1 温度区间 + 实况
-    lines.append(f"🌡 {today['tempMin']}~{today['tempMax']}℃ · 现在 {now['temp']}℃ {now['text']}")
-    # 3.2 降水时段扫描
+    # 3. 第一行:区名 + 温度区间 + 实况 + 风 + 湿度(单行)
+    line1 = (f"📍{name} {today['tempMin']}~{today['tempMax']}℃ 现{now['temp']}℃{now['text']} "
+             f"{now['windDir']}{now['windScale']}级 湿{now['humidity']}%")
+
+    # 4. 第二行:降水提醒 +(生活指数)+(晚间明早预览),空格拼成单行
     rain_text, has_rain = scan_rain(hourly)
-    lines.append(rain_text)
-    # 3.3 风 + 湿度
-    lines.append(f"💨 {now['windDir']}{now['windScale']}级 · 湿度{now['humidity']}%")
-    # 3.4 生活指数(失败则跳过)
-    idx_line = fetch_index_line(host, key, lid, slot)
-    if idx_line:
-        lines.append(idx_line)
-    # 3.5 晚间附加"明早"预览
+    parts = [rain_text]
+    # 4.1 生活指数(失败则跳过)
+    idx_word = fetch_index_word(host, key, lid, slot)
+    if idx_word:
+        parts.append(idx_word)
+    # 4.2 晚间附加"明早"预览
     if slot == "evening":
         tomorrow_md = (now_bj + timedelta(days=1)).strftime("%m-%d")
         tm = tomorrow_morning_line(hourly, tomorrow_md)
         if tm:
-            lines.append(tm)
+            parts.append(tm)
+    line2 = " ".join(parts)
 
-    return name, "\n".join(lines), has_rain
+    return line1, line2, has_rain
 
 
 def detect_slot(hour: int) -> str:
@@ -179,9 +184,7 @@ def detect_slot(hour: int) -> str:
 
 def build_header(slot: str, now_bj: datetime) -> tuple[str, str]:
     """根据时段生成标题与日期行。返回 (title, date_line)。"""
-    titles = {"morning": "🌅 早间天气播报",
-              "afternoon": "☀️ 午后天气播报",
-              "evening": "🌙 晚间天气播报"}
+    titles = {"morning": "🌅早间天气", "afternoon": "☀️午后天气", "evening": "🌙晚间天气"}
     weekday = WEEKDAYS[now_bj.weekday()]
     date_line = f"{now_bj.strftime('%m月%d日')} {weekday} {now_bj.strftime('%H:%M')}"
     return titles[slot], date_line
@@ -190,14 +193,14 @@ def build_header(slot: str, now_bj: datetime) -> tuple[str, str]:
 def build_tip(slot: str, any_rain: bool) -> str:
     """生成底部贴士:有雨优先提醒带伞,否则给时段问候语。"""
     if any_rain:
-        return "🌂 今日有雨,出门记得带伞"
-    return {"morning": "☕ 新的一天,注意早晚温差增减衣物",
-            "afternoon": "🍵 午后时光,记得多补水",
-            "evening": "🛌 早点休息,留意明日天气"}[slot]
+        return "🌂今日有雨,记得带伞"
+    return {"morning": "☕注意早晚温差增减衣物",
+            "afternoon": "🍵午后记得多补水",
+            "evening": "🛌早点休息,留意明日"}[slot]
 
 
 def main() -> int:
-    """读环境变量 → 判定时段 → 逐城市抓详细天气 → 组装 → 推送。"""
+    """读环境变量 → 判定时段 → 逐城市抓详细天气 → 填模板字段 → 推送给自己。"""
     # 1. 读取并校验环境变量
     appid = os.environ.get("APPID")
     secret = os.environ.get("APPSECRET")
@@ -218,28 +221,27 @@ def main() -> int:
     slot = detect_slot(now_bj.hour)
     print(f"北京时间 {now_bj:%Y-%m-%d %H:%M} · 时段={slot}")
 
-    # 3. 逐城市抓取摘要;单城失败降级为一行错误
+    # 3. 逐城市抓取两行;填进 c1/c1r/c2/c2r 字段,单城失败降级
     cities = parse_cities(city_raw)
-    blocks, any_rain = [], False
-    for city in cities:
+    fields, any_rain = {}, False
+    for i, city in enumerate(cities):
+        c, cr = f"c{i + 1}", f"c{i + 1}r"
         try:
-            name, summary, has_rain = build_city_summary(qhost, qkey, city, slot, now_bj)
-            blocks.append(f"📍{name}\n{summary}")
+            line1, line2, has_rain = build_city_lines(qhost, qkey, city, slot, now_bj)
+            fields[c], fields[cr] = line1, line2
             any_rain = any_rain or has_rain
         except Exception as exc:
-            blocks.append(f"📍{city}\n⚠️ 获取失败:{exc}")
+            fields[c], fields[cr] = f"📍{city} 获取失败", f"⚠️{exc}"
+    # 3.1 城市数超过模板槽位时提示(当前模板 2 个城市)
+    if len(cities) > 2:
+        print(f"提示:模板目前只有 2 个城市槽位,多出的不会显示:{cities[2:]}")
 
     # 4. 组装模板字段
     title, date_line = build_header(slot, now_bj)
-    data = {
-        "title": title,
-        "date": date_line,
-        "body": "\n\n".join(blocks),
-        "tip": build_tip(slot, any_rain),
-    }
+    data = {"title": title, "date": date_line, **fields, "tip": build_tip(slot, any_rain)}
     print("推送内容:\n" + "\n".join(f"{k}={v}" for k, v in data.items()))
 
-    # 5. 换 token 并推送
+    # 5. 换 token 并推送给自己
     token = get_access_token(appid, secret)
     result = send_template(token, openid, template_id, data)
     print("推送结果:", result)
