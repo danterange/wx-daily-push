@@ -1,0 +1,35 @@
+name: daily-weather-push
+
+# 触发方式:① 每天定时;② 手动点按钮(调试用)
+on:
+  schedule:
+    # cron 用的是 UTC 时间。'10 23 * * *' = UTC 23:10 = 北京时间次日 07:10。
+    # 注意:GitHub 定时任务高峰期可能延迟几分钟到几十分钟,属正常。
+    - cron: '10 23 * * *'
+  workflow_dispatch: {}
+
+jobs:
+  push:
+    runs-on: ubuntu-latest
+    steps:
+      # 1. 拉取仓库代码
+      - uses: actions/checkout@v4
+
+      # 2. 装 Python
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+
+      # 3. 装依赖
+      - run: pip install -r requirements.txt
+
+      # 4. 运行推送脚本;敏感值从 GitHub Secrets 注入,城市直接写明文
+      - run: python main.py
+        env:
+          APPID: ${{ secrets.APPID }}
+          APPSECRET: ${{ secrets.APPSECRET }}
+          TEMPLATE_ID: ${{ secrets.TEMPLATE_ID }}
+          OPENID: ${{ secrets.OPENID }}
+          QWEATHER_KEY: ${{ secrets.QWEATHER_KEY }}
+          QWEATHER_HOST: ${{ secrets.QWEATHER_HOST }}
+          CITY: 北京市昌平区,北京市海淀区
