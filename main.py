@@ -45,7 +45,17 @@ def qweather(host: str, key: str, path: str, params: dict) -> dict:
     path 形如 "/v7/weather/now";params 不需带 key,函数内部补上。
     """
     url = f"https://{host}{path}"
-    resp = requests.get(url, params={"key": key, **params}, timeout=10).json()
+    # 1. 网络异常(超时/断连)最多重试 3 次;接口逻辑错误(code!=200)不重试,直接抛
+    last_exc = None
+    for _ in range(3):
+        try:
+            resp = requests.get(url, params={"key": key, **params}, timeout=15).json()
+            break
+        except requests.RequestException as exc:
+            last_exc = exc
+    else:
+        raise RuntimeError(f"{path} 网络请求失败(已重试3次): {last_exc}")
+    # 2. 校验业务返回码
     if resp.get("code") != "200":
         raise RuntimeError(f"{path} 返回异常: {resp}")
     return resp
@@ -94,12 +104,14 @@ def scan_rain(hourly: list[dict]) -> tuple[str, bool]:
 
     # 3. 无降水:返回正向提示
     if not intervals:
-        return "☔未来24h无降水", False
+        return "未来24h无降水", False
 
-    # 4. 取首个降水时段,计算起止时刻与最大概率
+    # 4. 取首个降水时段;结束时刻取"雨停的那个钟点"(末个降水小时的下一钟点),
+    #    避免单小时出现 "23:00-23:00" 这种怪写法
     a, b = intervals[0]
     start = hourly[a]["fxTime"][11:16]
-    end = hourly[b]["fxTime"][11:16]
+    end_idx = b + 1 if b + 1 < len(hourly) else b
+    end = hourly[end_idx]["fxTime"][11:16]
     pops = []
     for k in range(a, b + 1):
         try:
@@ -109,7 +121,7 @@ def scan_rain(hourly: list[dict]) -> tuple[str, bool]:
     max_pop = max(pops) if pops else 0
     text = hourly[a].get("text", "降水")
     more = " 等" if len(intervals) > 1 else ""
-    return f"☔{start}-{end}{text}{max_pop}% 带伞{more}", True
+    return f"{start}-{end} {text} {max_pop}% 带伞{more}", True
 
 
 def tomorrow_morning_line(hourly: list[dict], tomorrow_md: str) -> str | None:
@@ -119,7 +131,7 @@ def tomorrow_morning_line(hourly: list[dict], tomorrow_md: str) -> str | None:
     if not picks:
         return None
     h = picks[len(picks) // 2]  # 取中间一条(约 7-8 点)
-    return f"🌙明早{h['fxTime'][11:16]}{h['text']}{h['temp']}℃"
+    return f"明早{h['fxTime'][11:16]} {h['text']}{h['temp']}度"
 
 
 def fetch_index_word(host: str, key: str, lid: str, slot: str) -> str | None:
@@ -152,7 +164,7 @@ def build_city_lines(host: str, key: str, city: str, slot: str, now_bj: datetime
     hourly = qweather(host, key, "/v7/weather/24h", {"location": lid})["hourly"]
 
     # 3. 第一行:区名 + 温度区间 + 实况 + 风 + 湿度(单行;行首不加 📍,模板标签已说明)
-    line1 = (f"{name} {today['tempMin']}~{today['tempMax']}℃ 现{now['temp']}℃{now['text']} "
+    line1 = (f"{name} {today['tempMin']}~{today['tempMax']}度 现{now['temp']}度 {now['text']} "
              f"{now['windDir']}{now['windScale']}级 湿{now['humidity']}%")
 
     # 4. 第二行:降水提醒 +(生活指数)+(晚间明早预览),空格拼成单行
@@ -168,7 +180,7 @@ def build_city_lines(host: str, key: str, city: str, slot: str, now_bj: datetime
         tm = tomorrow_morning_line(hourly, tomorrow_md)
         if tm:
             parts.append(tm)
-    line2 = " ".join(parts)
+    line2 = " | ".join(parts)
 
     return line1, line2, has_rain
 
@@ -184,7 +196,7 @@ def detect_slot(hour: int) -> str:
 
 def build_header(slot: str, now_bj: datetime) -> tuple[str, str]:
     """根据时段生成标题与日期行。返回 (title, date_line)。"""
-    titles = {"morning": "🌅早间天气", "afternoon": "☀️午后天气", "evening": "🌙晚间天气"}
+    titles = {"morning": "早间天气", "afternoon": "午后天气", "evening": "晚间天气"}
     weekday = WEEKDAYS[now_bj.weekday()]
     date_line = f"{now_bj.strftime('%m月%d日')} {weekday} {now_bj.strftime('%H:%M')}"
     return titles[slot], date_line
@@ -193,10 +205,10 @@ def build_header(slot: str, now_bj: datetime) -> tuple[str, str]:
 def build_tip(slot: str, any_rain: bool) -> str:
     """生成底部贴士:有雨优先提醒带伞,否则给时段问候语。"""
     if any_rain:
-        return "🌂今日有雨,记得带伞"
-    return {"morning": "☕注意早晚温差增减衣物",
-            "afternoon": "🍵午后记得多补水",
-            "evening": "🛌早点休息,留意明日"}[slot]
+        return "今日有雨,记得带伞"
+    return {"morning": "注意早晚温差,增减衣物",
+            "afternoon": "午后记得多补水",
+            "evening": "早点休息,留意明日"}[slot]
 
 
 def main() -> int:
