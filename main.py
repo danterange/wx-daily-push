@@ -151,8 +151,8 @@ def build_city_lines(host: str, key: str, city: str, slot: str, now_bj: datetime
     today = qweather(host, key, "/v7/weather/7d", {"location": lid})["daily"][0]
     hourly = qweather(host, key, "/v7/weather/24h", {"location": lid})["hourly"]
 
-    # 3. 第一行:区名 + 温度区间 + 实况 + 风 + 湿度(单行)
-    line1 = (f"📍{name} {today['tempMin']}~{today['tempMax']}℃ 现{now['temp']}℃{now['text']} "
+    # 3. 第一行:区名 + 温度区间 + 实况 + 风 + 湿度(单行;行首不加 📍,模板标签已说明)
+    line1 = (f"{name} {today['tempMin']}~{today['tempMax']}℃ 现{now['temp']}℃{now['text']} "
              f"{now['windDir']}{now['windScale']}级 湿{now['humidity']}%")
 
     # 4. 第二行:降水提醒 +(生活指数)+(晚间明早预览),空格拼成单行
@@ -231,14 +231,14 @@ def main() -> int:
             fields[c], fields[cr] = line1, line2
             any_rain = any_rain or has_rain
         except Exception as exc:
-            fields[c], fields[cr] = f"📍{city} 获取失败", f"⚠️{exc}"
+            fields[c], fields[cr] = f"{city} 获取失败", f"{exc}"
     # 3.1 城市数超过模板槽位时提示(当前模板 2 个城市)
     if len(cities) > 2:
         print(f"提示:模板目前只有 2 个城市槽位,多出的不会显示:{cities[2:]}")
 
-    # 4. 组装模板字段
+    # 4. 组装模板字段(时段标题并进 date 行;不再单独用 title 字段)
     title, date_line = build_header(slot, now_bj)
-    data = {"title": title, "date": date_line, **fields, "tip": build_tip(slot, any_rain)}
+    data = {"date": f"{title} {date_line}", **fields, "tip": build_tip(slot, any_rain)}
     print("推送内容:\n" + "\n".join(f"{k}={v}" for k, v in data.items()))
 
     # 5. 换 token 并推送给自己
