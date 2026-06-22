@@ -1,97 +1,203 @@
-"""每日推送主程序 —— 第一版:真实天气。
+"""每日天气推送主程序 —— 详细版。
 
-复用 test_push.py 里已验证通过的推送函数(get_access_token / send_template),
-新增"和风天气"抓取,把测试消息换成真实天气。
+数据来自和风天气;复用 test_push.py 中已验证的推送函数。
+特性:
+  · 实时天气 + 今日温度区间(逐天)
+  · 扫描未来 24 小时逐小时预报,智能生成"降水时段"提醒
+  · 生活指数(按时段选:早=穿衣 / 午=紫外线 / 晚=感冒)
+  · 时段感知:早间播报今日、午后播报、晚间附带"明早"预览
+  · 多城市,单城抓取失败自动降级不影响其他
 
 需要的环境变量:
     微信:   APPID / APPSECRET / TEMPLATE_ID / OPENID
     和风:   QWEATHER_KEY / QWEATHER_HOST(形如 xxxx.qweatherapi.com)
-    城市:   CITY(可选,默认"北京";多个城市用英文逗号或顿号分隔,
-                  如 "北京市昌平区,北京市海淀区")
-
-本地运行(PowerShell):
-    $env:QWEATHER_KEY="xxx"; $env:QWEATHER_HOST="xxxx.qweatherapi.com"; $env:CITY="北京市昌平区,北京市海淀区"; py main.py
-(微信那四个环境变量沿用 test_push 验证时设的即可)
+    城市:   CITY(多个用逗号/顿号分隔,默认"北京")
 """
 
 import os
 import sys
+from datetime import datetime, timezone, timedelta
+
 import requests
 
 from test_push import get_access_token, send_template
 
-
-def resolve_location_id(host: str, key: str, city: str) -> tuple[str, str]:
-    """用和风 GeoAPI 把城市名解析成 LocationID。
-
-    返回 (location_id, 标准化城市名)。和风天气接口要求传 LocationID
-    或经纬度,所以先用城市名查一次。查不到时抛 RuntimeError。
-    """
-    # 1. 调用城市查询接口
-    url = f"https://{host}/geo/v2/city/lookup"
-    resp = requests.get(url, params={"location": city, "key": key}, timeout=10).json()
-
-    # 2. 校验:code=="200" 且 location 列表非空才算成功
-    if resp.get("code") != "200" or not resp.get("location"):
-        raise RuntimeError(f"城市解析失败: {resp}")
-
-    # 3. 取第一个匹配结果
-    top = resp["location"][0]
-    return top["id"], top["name"]
-
-
-def fetch_weather(host: str, key: str, location_id: str) -> dict:
-    """抓取指定 LocationID 的实时天气,返回和风的 now 字段字典。
-
-    失败(code 非 "200")时抛 RuntimeError 带出原始响应。
-    """
-    # 1. 调用实时天气接口
-    url = f"https://{host}/v7/weather/now"
-    resp = requests.get(url, params={"location": location_id, "key": key}, timeout=10).json()
-
-    # 2. 校验返回码
-    if resp.get("code") != "200":
-        raise RuntimeError(f"天气抓取失败: {resp}")
-
-    # 3. 返回实时天气对象(含 text/temp/feelsLike/humidity/windDir 等)
-    return resp["now"]
-
-
-def build_weather_text(now: dict) -> str:
-    """把和风的 now 字典拼成一句人类可读的天气描述。"""
-    return (f"{now['text']} {now['temp']}℃"
-            f"(体感{now['feelsLike']}℃,湿度{now['humidity']}%,"
-            f"{now['windDir']}{now['windScale']}级)")
+# 生活指数 type 代码:3=穿衣, 5=紫外线, 9=感冒(见和风文档)
+SLOT_INDEX_TYPE = {"morning": "3", "afternoon": "5", "evening": "9"}
+WEEKDAYS = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"]
 
 
 def parse_cities(raw: str) -> list[str]:
     """把 CITY 环境变量解析成城市列表,支持英文逗号 / 中文逗号 / 顿号分隔。"""
-    # 1. 统一各种分隔符为英文逗号
     for sep in ("，", "、"):
         raw = raw.replace(sep, ",")
-    # 2. 拆分、去空白、过滤空项
     return [c.strip() for c in raw.split(",") if c.strip()]
 
 
-def collect_weather(host: str, key: str, cities: list[str]) -> str:
-    """依次抓取多个城市的天气,拼成多行文本;单个城市失败不影响其他。"""
-    # 1. 逐个城市抓取,失败的城市单独标注、继续下一个
-    lines = []
-    for city in cities:
+def qweather(host: str, key: str, path: str, params: dict) -> dict:
+    """调用和风某个接口并返回 JSON;code 非 "200" 时抛 RuntimeError。
+
+    path 形如 "/v7/weather/now";params 不需带 key,函数内部补上。
+    """
+    url = f"https://{host}{path}"
+    resp = requests.get(url, params={"key": key, **params}, timeout=10).json()
+    if resp.get("code") != "200":
+        raise RuntimeError(f"{path} 返回异常: {resp}")
+    return resp
+
+
+def resolve_location_id(host: str, key: str, city: str) -> tuple[str, str]:
+    """城市名 → (LocationID, 标准化城市名),用和风 GeoAPI 查询。"""
+    resp = qweather(host, key, "/geo/v2/city/lookup", {"location": city})
+    if not resp.get("location"):
+        raise RuntimeError(f"城市解析无结果: {city}")
+    top = resp["location"][0]
+    return top["id"], top["name"]
+
+
+def scan_rain(hourly: list[dict]) -> tuple[str, bool]:
+    """扫描逐小时数据,生成首个降水时段提醒。
+
+    判定某小时"可能下雨"的条件:降水量 > 0 或 降水概率 >= 50%。
+    返回 (描述文本, 是否有雨)。无雨时返回正向提示。
+    """
+    # 1. 把每小时标记为是否降水
+    flags = []
+    for h in hourly:
         try:
-            # 1.1 城市名 → LocationID → 实时天气 → 文本
-            location_id, city_name = resolve_location_id(host, key, city)
-            now = fetch_weather(host, key, location_id)
-            lines.append(f"{city_name}:{build_weather_text(now)}")
-        except Exception as exc:
-            # 1.2 单城失败降级:记一行错误,不中断整体
-            lines.append(f"{city}:获取失败({exc})")
-    # 2. 多行合并
-    return "\n".join(lines)
+            precip = float(h.get("precip") or 0)
+        except ValueError:
+            precip = 0.0
+        try:
+            pop = int(h.get("pop") or 0)
+        except ValueError:
+            pop = 0
+        flags.append(precip > 0 or pop >= 50)
+
+    # 2. 找出所有连续降水区间
+    intervals = []
+    i, n = 0, len(hourly)
+    while i < n:
+        if flags[i]:
+            j = i
+            while j + 1 < n and flags[j + 1]:
+                j += 1
+            intervals.append((i, j))
+            i = j + 1
+        else:
+            i += 1
+
+    # 3. 无降水:返回正向提示
+    if not intervals:
+        return "☔ 未来24h无降水 ✅", False
+
+    # 4. 取首个降水时段,计算起止时刻与最大概率
+    a, b = intervals[0]
+    start = hourly[a]["fxTime"][11:16]
+    end = hourly[b]["fxTime"][11:16]
+    pops = []
+    for k in range(a, b + 1):
+        try:
+            pops.append(int(hourly[k].get("pop") or 0))
+        except ValueError:
+            pass
+    max_pop = max(pops) if pops else 0
+    text = hourly[a].get("text", "降水")
+    more = "  等多段" if len(intervals) > 1 else ""
+    return f"☔ {start}-{end} {text}(概率{max_pop}%),记得带伞{more}", True
+
+
+def tomorrow_morning_line(hourly: list[dict], tomorrow_md: str) -> str | None:
+    """从逐小时数据里挑明天早晨(6-9 点)一条预览,供晚间播报用;无则返回 None。"""
+    picks = [h for h in hourly
+             if h["fxTime"][5:10] == tomorrow_md and 6 <= int(h["fxTime"][11:13]) <= 9]
+    if not picks:
+        return None
+    h = picks[len(picks) // 2]  # 取中间一条(约 7-8 点)
+    return f"🌙 明早{h['fxTime'][11:16]}:{h['text']} {h['temp']}℃"
+
+
+def fetch_index_line(host: str, key: str, lid: str, slot: str) -> str | None:
+    """按时段抓对应生活指数,返回一行如 "👕 穿衣:炎热";失败返回 None(降级)。"""
+    itype = SLOT_INDEX_TYPE[slot]
+    try:
+        resp = qweather(host, key, "/indices/1d", {"location": lid, "type": itype})
+    except Exception:
+        return None
+    daily = resp.get("daily") or []
+    if not daily:
+        return None
+    idx = daily[0]
+    name = idx.get("name", "").replace("指数", "")
+    return f"📋 {name}:{idx.get('category', '')}"
+
+
+def build_city_summary(host: str, key: str, city: str, slot: str, now_bj: datetime) -> tuple[str, str, bool]:
+    """抓取单个城市的多维度天气,拼成多行摘要。
+
+    返回 (城市名, 摘要文本, 是否有雨)。任一接口失败由上层捕获降级。
+    """
+    # 1. 城市解析
+    lid, name = resolve_location_id(host, key, city)
+
+    # 2. 实时 / 逐天 / 逐小时
+    now = qweather(host, key, "/v7/weather/now", {"location": lid})["now"]
+    today = qweather(host, key, "/v7/weather/7d", {"location": lid})["daily"][0]
+    hourly = qweather(host, key, "/v7/weather/24h", {"location": lid})["hourly"]
+
+    # 3. 逐行拼装
+    lines = []
+    # 3.1 温度区间 + 实况
+    lines.append(f"🌡 {today['tempMin']}~{today['tempMax']}℃ · 现在 {now['temp']}℃ {now['text']}")
+    # 3.2 降水时段扫描
+    rain_text, has_rain = scan_rain(hourly)
+    lines.append(rain_text)
+    # 3.3 风 + 湿度
+    lines.append(f"💨 {now['windDir']}{now['windScale']}级 · 湿度{now['humidity']}%")
+    # 3.4 生活指数(失败则跳过)
+    idx_line = fetch_index_line(host, key, lid, slot)
+    if idx_line:
+        lines.append(idx_line)
+    # 3.5 晚间附加"明早"预览
+    if slot == "evening":
+        tomorrow_md = (now_bj + timedelta(days=1)).strftime("%m-%d")
+        tm = tomorrow_morning_line(hourly, tomorrow_md)
+        if tm:
+            lines.append(tm)
+
+    return name, "\n".join(lines), has_rain
+
+
+def detect_slot(hour: int) -> str:
+    """按北京时间小时判定时段:早 / 午后 / 晚。"""
+    if 5 <= hour < 12:
+        return "morning"
+    if 12 <= hour < 18:
+        return "afternoon"
+    return "evening"
+
+
+def build_header(slot: str, now_bj: datetime) -> tuple[str, str]:
+    """根据时段生成标题与日期行。返回 (title, date_line)。"""
+    titles = {"morning": "🌅 早间天气播报",
+              "afternoon": "☀️ 午后天气播报",
+              "evening": "🌙 晚间天气播报"}
+    weekday = WEEKDAYS[now_bj.weekday()]
+    date_line = f"{now_bj.strftime('%m月%d日')} {weekday} {now_bj.strftime('%H:%M')}"
+    return titles[slot], date_line
+
+
+def build_tip(slot: str, any_rain: bool) -> str:
+    """生成底部贴士:有雨优先提醒带伞,否则给时段问候语。"""
+    if any_rain:
+        return "🌂 今日有雨,出门记得带伞"
+    return {"morning": "☕ 新的一天,注意早晚温差增减衣物",
+            "afternoon": "🍵 午后时光,记得多补水",
+            "evening": "🛌 早点休息,留意明日天气"}[slot]
 
 
 def main() -> int:
-    """读环境变量 → 查城市 → 抓天气 → 推送到微信。"""
+    """读环境变量 → 判定时段 → 逐城市抓详细天气 → 组装 → 推送。"""
     # 1. 读取并校验环境变量
     appid = os.environ.get("APPID")
     secret = os.environ.get("APPSECRET")
@@ -107,21 +213,35 @@ def main() -> int:
         print(f"缺少环境变量: {', '.join(missing)}")
         return 1
 
-    # 2. 解析城市列表 → 逐个抓实时天气 → 合并成多行文本
+    # 2. 计算北京时间与时段(GitHub Actions 跑在 UTC)
+    now_bj = datetime.now(timezone.utc) + timedelta(hours=8)
+    slot = detect_slot(now_bj.hour)
+    print(f"北京时间 {now_bj:%Y-%m-%d %H:%M} · 时段={slot}")
+
+    # 3. 逐城市抓取摘要;单城失败降级为一行错误
     cities = parse_cities(city_raw)
-    weather_text = collect_weather(qhost, qkey, cities)
-    print(f"天气:\n{weather_text}")
+    blocks, any_rain = [], False
+    for city in cities:
+        try:
+            name, summary, has_rain = build_city_summary(qhost, qkey, city, slot, now_bj)
+            blocks.append(f"📍{name}\n{summary}")
+            any_rain = any_rain or has_rain
+        except Exception as exc:
+            blocks.append(f"📍{city}\n⚠️ 获取失败:{exc}")
 
-    # 3. 换微信 token 并推送(字段名需与测试号模板的 {{关键词.DATA}} 对应)
-    token = get_access_token(appid, secret)
+    # 4. 组装模板字段
+    title, date_line = build_header(slot, now_bj)
     data = {
-        "city": "、".join(cities),
-        "weather": weather_text,
-        "news": "(新闻模块待接入)",
+        "title": title,
+        "date": date_line,
+        "body": "\n\n".join(blocks),
+        "tip": build_tip(slot, any_rain),
     }
-    result = send_template(token, openid, template_id, data)
+    print("推送内容:\n" + "\n".join(f"{k}={v}" for k, v in data.items()))
 
-    # 4. 打印结果
+    # 5. 换 token 并推送
+    token = get_access_token(appid, secret)
+    result = send_template(token, openid, template_id, data)
     print("推送结果:", result)
     return 0 if result.get("errcode") == 0 else 1
 
