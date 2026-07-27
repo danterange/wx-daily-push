@@ -1,34 +1,41 @@
-name: daily-weather-push
+name: weather-push
 
-# 触发方式:① 每天定时;② 手动点按钮(调试用)
+# 定时触发按 UTC 书写；北京时间 = UTC + 8。
 on:
   schedule:
-    # cron 用 UTC 时间,北京时间 = UTC + 8。一天四次;分钟错开整点,降低被 GitHub 延迟/跳过的概率:
-    - cron: '32 0 * * *'   # UTC 00:32 = 北京 08:32 (早八点半)
-    - cron: '3 4 * * *'    # UTC 04:03 = 北京 12:03 (中午十二点)
-    - cron: '4 9 * * *'    # UTC 09:04 = 北京 17:04 (下午五点)
-    - cron: '3 15 * * *'   # UTC 15:03 = 北京 23:03 (晚上十一点)
-    # 注意:GitHub 定时任务仍 best-effort,高峰期可能延迟几分钟、偶尔跳过(无 SLA)。
-  workflow_dispatch: {}
+    # 仅检查未来 24 小时。无降水或不良天气时脚本会成功结束，不发送微信消息。
+    - cron: '3 21 * * *'  # 北京时间 05:03（UTC 前一天）
+    - cron: '3 2 * * *'   # 北京时间 10:03
+    - cron: '3 10 * * *'  # 北京时间 18:03
+    # 每天固定发送一次简洁的明日天气摘要。
+    - cron: '3 15 * * *'  # 北京时间 23:03
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: Run a monitoring check or the nightly summary
+        required: false
+        default: summary
+        type: choice
+        options:
+          - summary
+          - monitor
 
 jobs:
   push:
     runs-on: ubuntu-latest
     steps:
-      # 1. 拉取仓库代码
       - uses: actions/checkout@v4
 
-      # 2. 装 Python
       - uses: actions/setup-python@v5
         with:
           python-version: '3.13'
 
-      # 3. 装依赖
       - run: pip install -r requirements.txt
 
-      # 4. 运行推送脚本;敏感值从 GitHub Secrets 注入,城市直接写明文
       - run: python main.py
         env:
+          # 手动运行默认发送晚间摘要；三个监测 cron 使用 monitor，23:03 cron 使用 summary。
+          RUN_MODE: ${{ github.event_name == 'workflow_dispatch' && inputs.mode || (github.event.schedule == '3 15 * * *' && 'summary' || 'monitor') }}
           APPID: ${{ secrets.APPID }}
           APPSECRET: ${{ secrets.APPSECRET }}
           TEMPLATE_ID: ${{ secrets.TEMPLATE_ID }}
