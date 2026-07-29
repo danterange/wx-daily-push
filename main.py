@@ -17,6 +17,12 @@ from test_push import get_access_token, send_template
 # 降水概率达到该阈值时，即使预报文字尚未写明下雨，也作为"可能降水"提醒。
 RAIN_PROBABILITY_THRESHOLD = 30
 
+# 微信测试号模板的单个关键词字段最多显示 20 个字符；超出后客户端会省略。
+TEMPLATE_FIELD_MAX_LENGTH = 20
+
+# 风险天气名称保留的最大长度，给时间和降水概率留出足够空间。
+RISK_LABEL_MAX_LENGTH = 8
+
 # 和风天气的 text 字段中，包含这些词即视为需要提醒的天气。
 ADVERSE_WEATHER_KEYWORDS = (
     "冰雹",
@@ -79,6 +85,19 @@ def number(value: object, converter, default: float | int = 0):
         return default
 
 
+def fit_template_field(value: object, max_length: int = TEMPLATE_FIELD_MAX_LENGTH) -> str:
+    """将模板字段规范为单行，并确保不会被微信客户端自动截断。"""
+    text = " ".join(str(value).split())
+    if len(text) <= max_length:
+        return text
+    return f"{text[: max_length - 1]}…"
+
+
+def compact_risk_label(label: str) -> str:
+    """压缩过长的天气描述，保留开头的主要天气现象。"""
+    return fit_template_field(label, RISK_LABEL_MAX_LENGTH)
+
+
 def weather_risk_label(weather_text: str) -> str | None:
     """返回预报文字中的恶劣天气标签；晴、多云、阴等返回 None。"""
     weather_text = weather_text.strip()
@@ -103,16 +122,16 @@ def hourly_risk_label(hour: dict) -> str | None:
     return None
 
 
-def display_time(hour: dict) -> str:
-    """将和风的 fxTime 格式化为紧凑的月日和时间。"""
+def risk_start_time(hour: dict) -> str:
+    """将风险预报时间压缩为时刻，例如“07 时”压缩为“7 时”。"""
     value = str(hour.get("fxTime") or "")
-    if len(value) >= 16:
-        return value[5:16].replace("T", " ")
-    return value or "近期"
+    if len(value) >= 13 and value[11:13].isdigit():
+        return f"{int(value[11:13])}时"
+    return "近期"
 
 
 def future_risk_summary(hourly: list[dict]) -> str | None:
-    """汇总未来 24 小时的风险；完全无风险时返回 None。"""
+    """汇总未来 24 小时的首个风险，生成可完整显示的短文案。"""
     risks = [(hour, label) for hour in hourly if (label := hourly_risk_label(hour))]
     if not risks:
         return None
@@ -123,10 +142,10 @@ def future_risk_summary(hourly: list[dict]) -> str | None:
             labels.append(label)
 
     highest_probability = max(number(hour.get("pop"), int) for hour, _ in risks)
-    probability_text = f"，降水概率最高 {highest_probability}%" if highest_probability else ""
-    return (
-        f"未来 24 小时可能有{'、'.join(labels[:3])}，"
-        f"最早 {display_time(risks[0][0])}{probability_text}"
+    more_text = "等" if len(labels) > 1 else ""
+    probability_text = f"，{highest_probability}%" if highest_probability else ""
+    return fit_template_field(
+        f"{risk_start_time(risks[0][0])}起{compact_risk_label(labels[0])}{more_text}{probability_text}"
     )
 
 
@@ -174,17 +193,17 @@ def build_summary_lines(
 
     high = forecast.get("tempMax", "?")
     low = forecast.get("tempMin", "?")
-    line1 = f"{name} 明天最高 {high} 度，最低 {low} 度"
-    line2 = f"天气：{'有 ' + '、'.join(risks) if risks else '无雨及其他不良天气'}"
+    line1 = f"{name}明日{low}~{high}度"
+    line2 = "、".join(compact_risk_label(risk) for risk in risks) if risks else "无降水和恶劣天气"
     return line1, line2
 
 
 def template_fields(lines: list[tuple[str, str]]) -> dict[str, str]:
-    """将最多两个城市的两行内容映射到当前微信模板字段。"""
+    """将最多两个城市的两行内容映射到当前微信模板字段并控制字数。"""
     fields: dict[str, str] = {}
     for index, (line1, line2) in enumerate(lines[:2], start=1):
-        fields[f"c{index}"] = line1
-        fields[f"c{index}r"] = line2
+        fields[f"c{index}"] = fit_template_field(line1)
+        fields[f"c{index}r"] = fit_template_field(line2)
     return fields
 
 

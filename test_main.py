@@ -6,9 +6,11 @@ from unittest.mock import patch
 import main as weather_push
 from main import (
     RAIN_PROBABILITY_THRESHOLD,
+    TEMPLATE_FIELD_MAX_LENGTH,
     daily_risk_labels,
     future_risk_summary,
     hourly_risk_label,
+    template_fields,
     tomorrow_forecast,
 )
 
@@ -52,14 +54,37 @@ class WeatherRiskTests(unittest.TestCase):
         self.assertEqual(hourly_risk_label(forecast[0]), "降水")
         self.assertEqual(
             future_risk_summary(forecast),
-            "未来 24 小时可能有降水，最早 07-28 10:00，降水概率最高 30%",
+            "10时起降水，30%",
         )
 
     def test_thunderstorm_triggers_even_without_precipitation_probability(self):
         forecast = [hourly("2026-07-28T18:00+08:00", "雷阵雨", "0", "0")]
 
         self.assertEqual(hourly_risk_label(forecast[0]), "雷阵雨")
-        self.assertIn("雷阵雨", future_risk_summary(forecast))
+        self.assertEqual(future_risk_summary(forecast), "18时起雷阵雨")
+
+    def test_monitor_summary_fits_template_when_weather_text_is_long(self):
+        forecast = [
+            hourly("2026-07-28T07:00+08:00", "强雷阵雨伴有短时强降水", "0", "100"),
+            hourly("2026-07-28T08:00+08:00", "大雨", "0", "80"),
+        ]
+
+        summary = future_risk_summary(forecast)
+
+        self.assertIsNotNone(summary)
+        self.assertLessEqual(len(summary), TEMPLATE_FIELD_MAX_LENGTH)
+        self.assertTrue(summary.startswith("7时起强雷阵雨"))
+        self.assertIn("100%", summary)
+
+    def test_template_fields_normalize_and_limit_each_city_field(self):
+        fields = template_fields(
+            [("北京市特别长的区域名称明日天气提醒以及额外说明", "第一行\n第二行以及一段很长的天气预报说明")]
+        )
+
+        self.assertLessEqual(len(fields["c1"]), TEMPLATE_FIELD_MAX_LENGTH)
+        self.assertLessEqual(len(fields["c1r"]), TEMPLATE_FIELD_MAX_LENGTH)
+        self.assertNotIn("\n", fields["c1r"])
+        self.assertTrue(fields["c1"].endswith("…"))
 
     def test_tomorrow_summary_uses_date_not_list_position(self):
         now_bj = datetime(2026, 7, 27, 23, 3, tzinfo=timezone.utc)
